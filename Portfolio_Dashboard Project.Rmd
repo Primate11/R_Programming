@@ -1,0 +1,817 @@
+---
+title: "AFA Dashboard - 2021"
+output: 
+  flexdashboard::flex_dashboard:
+    social: menu
+    theme: united
+    orientation: rows
+    vertical_layout: scroll
+    navbar: 
+    - {title: "Yahoo Finance", href: "https://finance.yahoo.com/lookup/", align: left }
+runtime: shiny
+storyboard: true
+---
+
+```{r global, include=FALSE}
+library(PerformanceAnalytics)
+library(quantmod)
+library(dygraphs)
+library(lubridate)
+library(bizdays)
+library(tidyquant)
+library(flexdashboard)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(tidyr)
+library(plotly)
+library(highcharter)
+library(shiny)
+library(tidyverse)
+library(plyr)
+library(timetk)
+library(tidyquant)
+library(corrplot)
+library(reshape2)
+```
+```{r}
+# List of tickers in an (object), to use in functions  
+stock_ticker <-   c("AMZN","AAPL","WMT","ROK")
+# Stocks weight on portfolio
+wts <- c(.30, .25, .25, .20)
+# chosen index for comparison
+Index_ticker <- "^GSPC"
+
+# Decided to take data from 2015. To focus on recent data.
+base_date <- ("2015-01-01") 
+
+# Tried to create a calender based on the opening days 
+# of the US Stock eXchange - Circa 252 trading days per year.
+# Beyond weekends,stock market closes for 9 holidays a year, 
+# but they are difficult to add as they change every year.
+
+cal <- create.calendar(name = 'StockAnalysis',holidays = integer(0),
+                       weekdays=c("saturday", "sunday"),financial = TRUE)
+no_tradingdays <- bizdays(base_date, Sys.Date(),cal ='StockAnalysis' )
+
+# Create this, to remove the holidays from the chosen period.
+no_obs <- ceiling(no_tradingdays - (0.0345 * (no_tradingdays)))
+
+# Searched and found what works for me, in using and adapting funtions to my needs. 
+
+# Get the data on the chosen stocks 
+stock_data <-  function(stocks_ticker,from ) {
+  
+getSymbols(stocks_ticker, src = "yahoo", env = NULL, from ='2015-01-01')}
+
+# We llok to extract, prices and volumes from the stock data. 
+# Get the adjusted prices from the data and put them together on a table, lapply. 
+
+Adj_Prices <- map(stock_ticker,stock_data) %>% map(Ad) %>% 
+  reduce(merge.xts)%>% na.omit()
+
+names(Adj_Prices) <- stock_ticker
+
+# # Get the volume from the data and put them together on a table, lapply
+
+Volume <- map(stock_ticker,stock_data) %>% map(Vo) %>% reduce(merge.xts)%>% na.omit()
+names(Volume) <- stock_ticker
+
+# Turn the daily prices and volumes into monthly and turn the prices into return
+Price_Monthly <- to.period(Adj_Prices,period ="months", OHLC = FALSE,drop.time=TRUE)
+Volume_Monthly <- to.period(Volume, period = "months", OHLC = FALSE,drop.time=TRUE)
+Return_Monthly <-  Return.calculate(Price_Monthly, method = "log" ) %>% na.omit()
+
+# The respective weights to create a portfolio on a table.
+Stocks_weight <- tibble(symbol = stock_ticker,
+                        weights = wts )
+wetab <- kable(data.frame(Stocks_weight), caption = "Stocks weights")
+
+# Barchart of weights
+blank_theme <- theme_minimal()+
+  theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.border = element_blank(),
+  panel.grid=element_blank(),
+  axis.ticks = element_blank(),
+  plot.title=element_text(size=14, face="bold")
+  )
+ webar <- ggplot(data.frame(Stocks_weight),aes(x="Portfolio",
+ y=weights, fill=symbol))+ geom_bar(width = 1,
+ stat = "identity") + scale_fill_brewer("Stocks",palette = "Blues") + blank_theme
+
+#  Analysis on ind. assets:At some point, noticed that using different packages 
+#  to get that can create conflicts in the type of data to pass from a 
+#  function to the other. Had difficulties fitting the data, so I tried a 
+#  different source. 
+#  Feeding the stock tickers into tidyquant, I directly got the returns. 
+#  Compared to data from quantmod, this is easier to manupulate and merge with 
+#  the index data.
+
+Tibb_Prices <-  stock_ticker %>%tq_get(get  = "stock.prices",
+                                    from = base_date)
+Tibb_return <- Tibb_Prices%>%group_by(symbol) %>%
+  tq_transmute(select     = adjusted, 
+               mutate_fun = periodReturn, 
+               period     = "monthly", 
+               col_rename = "Return") 
+
+PT_TIBB_returns_monthly <- Tibb_return %>%
+  tq_portfolio(assets_col  = symbol, 
+               returns_col = Return, 
+               weights     = Stocks_weight, 
+               col_rename  = "Return")
+
+PT_TIBB_returns_monthly <- add_column(PT_TIBB_returns_monthly,symbol = "PF.AFA" )
+
+
+# Get index returns,using tidyquant this time. 
+# To test a diffent packege, it permits to get directly the monthly prices. 
+Index_prices <-  Index_ticker %>% tq_get(get  = "stock.prices",
+                                     from = base_date)%>% na.omit()
+Index_return_monthly <- Index_prices %>%group_by(symbol) %>%
+  tq_transmute(select     = adjusted, 
+               mutate_fun = periodReturn, 
+               period     = "monthly", 
+               col_rename = "Return")
+# Calculating the correlation
+stocks_correlate <- Tibb_return %>%
+  spread(symbol, value = Return) %>%
+  tk_xts(silent = TRUE) %>%
+  cor()
+
+# Sharpe Ratio of the stocks in the portfolip
+Stocks_SharpeRatio <- Tibb_return %>%
+  tq_performance(Ra = Return, Rb = NULL, 
+                 performance_fun = SharpeRatio,  Rf = 0.0000 / 12, 
+                 p  = 0.99) 
+colnames(Stocks_SharpeRatio) <-c("Stock","ESSharpe","StdDevSharpe","VaRSharpe")
+Stocks_SharpeRatio <- kable(Stocks_SharpeRatio, digits = 4,
+                            caption = "Stocks SharpeRatio")
+# StdDev OF THE STOCKS
+Stocks_SD <- StdDev( Return_Monthly,clean = c("none", "boudt", "geltner", "locScaleRob"),
+                    portfolio_method = c("component"),weights =wts,use = "everything",method = c("pearson"),SE = FALSE, SE.control = NULL)
+Stocks_SD <- kable(data.frame(Stocks_SD),digits = 4, caption = "Stocks StdDev")
+
+
+# GraphS of STOCKS returns? prices, volumes
+# First graph of returns
+Returns <- dygraph(Return_Monthly, main = "Stocks Returns") %>%
+  dyAxis("y", label = "%") %>%
+  dyOptions(colors = RColorBrewer::brewer.pal(4, "Set2"))
+# First graph of Volumes
+Volumes <- dygraph(Volume_Monthly, main = "Trade Volumes") %>%
+  dyAxis("y") %>%
+  dyOptions(colors = RColorBrewer::brewer.pal(4, "Set2"))
+# First graph of Prices
+Prices <- dygraph(Price_Monthly, main = "Stocks Prices") %>%
+  dyAxis("y", label = "$") %>%
+  dyOptions(colors = RColorBrewer::brewer.pal(4, "Set2"))
+
+# Now that we have the stock data, we move to the  index data
+
+
+# Get index returns,using tidyquant this time. 
+# To test a diffent packege, it permits to get directly the monthly prices. 
+
+Index_prices <-  Index_ticker %>% tq_get(get  = "stock.prices",
+                                     from = base_date)%>% na.omit()
+Index_return_monthly <- Index_prices %>%group_by(symbol) %>%
+  tq_transmute(select     = adjusted, 
+               mutate_fun = periodReturn, 
+               period     = "monthly", 
+               col_rename = "Return")
+
+
+ # Turn the daily index prices to monthly returns return
+Adj_Price_Index <- map(Index_ticker,stock_data) %>% map(Ad) %>% 
+  reduce(merge.xts)%>% na.omit()
+Price_Monthly_Index <- to.period(Adj_Price_Index,period ="months",
+                                 OHLC = FALSE,drop.time=TRUE)
+
+Return_Monthly_Index <- Return.calculate(Price_Monthly_Index, 
+                      method = "log" ) %>% na.omit()%>%  round(4) 
+names(Return_Monthly_Index) <- "S&P 500"
+
+
+# With PerformanceAnalytics function Return.portfolio
+# To calculate the monthly returns on the portfolio, applying the vector of weights 'w'.
+PF_monthly_returns <- Return.portfolio(Return_Monthly,
+                      weights = wts)%>% round(4) 
+names(PF_monthly_returns) <- "AFA 21"
+# To calculate the monthly returns on the portfolio, applying the vector of weights 'w'.
+# In dollar terms
+PFD_monthly_returns <- Return.portfolio(Return_Monthly,
+                      weights = wts, wealth.index = TRUE)%>% round(4)
+
+# Use dygraphs to chart the portfolio monthly returns.
+# 
+Portfolio_Monthly_Return <- dygraph(PF_monthly_returns,
+                            main = "Portfolio Monthly Return") %>%
+                            dyAxis("y", label = "%")
+# growth of $1 invested in the portfolio
+Portfolio_Monthly_DoReturn <- dygraph(PFD_monthly_returns,
+                  main = "Portfolio Monthly Return") %>%
+                  dyAxis("y", label = "$")
+
+
+# Stock performance vs Risk
+# Return.excess function from PerformanceAnalytics,to calculate the ratios
+#current yields are negative, so we use an hypothetical 0.000%
+portfolio_excess_returns <- Return.excess(PF_monthly_returns, Rf = .000000)%>% round(4)
+
+# StdDev of portfolio
+SD_Portfolio <- StdDev(Return_Monthly_Index,clean = c("none", "boudt", "geltner", "locScaleRob"),portfolio_method = c("single"),use = "everything",method = c("pearson")) %>%  round(4) 
+colnames(SD_Portfolio) <- "Portfolio_StdDeV"
+
+
+# Performance measures for the dashboard
+# Sharpe Ratio
+Sharpe_ratio <- SharpeRatio(PF_monthly_returns,Rf = 0.0000,p = 0.99,
+              FUN = c("StdDev", "VaR", "ES"),annualize=TRUE) %>%round(4)   
+colnames(Sharpe_ratio) <- "Ratio"
+rownames(Sharpe_ratio) <- c("StdDev Sharpe","VaR Sharpe","ES Sharpe")
+Sharpe_PF_Tab <- kable(data.frame(Sharpe_ratio), caption = "Sharpe Measure Annualized", "rst")
+
+# InformationRatio = ActivePremium/TrackingError
+PF_InformationRatio <- InformationRatio(PF_monthly_returns, Return_Monthly_Index, 
+                                     scale = 12) %>%  round(4) 
+
+# Treynor Index
+PF_TreynorRatio <- TreynorRatio(PF_monthly_returns, Return_Monthly_Index, Rf = 0, 
+                             scale = 12, modified = FALSE ) %>%  round(4) 
+
+# Jensen Index
+#CAPM.jensenAlpha 
+PF_JensenAlpha<- CAPM.jensenAlpha(PF_monthly_returns, Return_Monthly_Index, Rf = 0, 
+                               scale = 12) %>% round(4) 
+
+#Joining the different rario together
+PF_Return_Risk <- matrix(c(PF_InformationRatio,PF_TreynorRatio,PF_JensenAlpha),ncol=1,byrow=TRUE)
+ colnames(PF_Return_Risk) <- c("Measure")
+ rownames(PF_Return_Risk) <- c("InformationRatio","TreynorRatio","JensenAlpha")
+ 
+Risk_Return__PF_Tab <- kable(data.frame(PF_Return_Risk), caption = "Risk Return Measures", "rst")
+
+#Join the sharpe ratio table and the other measures
+Risk_Return <- kable(
+  list(data.frame(Sharpe_ratio),data.frame(PF_Return_Risk)),
+  caption = 'Risk Return Measures for portfolio AFA21',
+  booktabs = TRUE, valign = 't'
+)
+
+#  Plotting the portfolio performance for Analysis. 
+
+# Add column AFA21 to Tibb as symbol, then remove the original lebels,
+# join with the index and try high charts agains
+
+
+AFA_21_vs_SP500 <-full_join(PT_TIBB_returns_monthly, 
+           Index_return_monthly,
+           by=c("symbol" = "symbol","date"="date", "Return"="Return"))
+
+colnames(AFA_21_vs_SP500) <- c("Date","Monthly_Return" ,"Portfolio_Index" )
+
+HC_Return_vs_Index <- hchart(AFA_21_vs_SP500, "column", 
+       hcaes(x = Date, y = Monthly_Return, group = Portfolio_Index), name =c("S&P500","AFA_21"))%>% 
+  hc_yAxis(opposite = TRUE, labels = list(format = "{value}%"))%>% 
+hc_tooltip(pointFormat = '{point.x: %Y-%m} {point.y:.4f}% ')
+
+
+#importing  Apple data 
+dt <- "2015-1-1"
+aapl <- getSymbols.yahoo ("AAPL", from=dt, auto.assign = F)
+
+#making the graph chart based on closing prices (the 4th column) using function 
+#na.omit to remove all the incomplete cases from the data
+aaplClose <- na.omit(getSymbols.yahoo ("AAPL", from=dt, auto.assign = F)[ ,4])
+aaplRets <- na.omit(dailyReturn( aaplClose, type="log"))
+# dynamics of the returns
+#specified histogram of returns with lower frequency
+
+
+#importing Amazon  data
+dt <- "2015-1-1"
+amzn <- getSymbols.yahoo ("AMZN", from=dt, auto.assign = F)
+amznClose <- na.omit(getSymbols.yahoo ("AMZN", from=dt, auto.assign = F)[ ,4])
+amznRets <- na.omit(dailyReturn( amznClose, type="log"))
+
+
+#importing WMT data
+dt <- "2015-1-1"
+wmt <- getSymbols.yahoo ("WMT", from=dt, auto.assign = F)
+wmtClose <- na.omit(getSymbols.yahoo ("WMT", from=dt, auto.assign = F)[ ,4])
+wmtRets <- na.omit(dailyReturn( wmtClose, type="log"))
+
+
+#importing ROK  data
+dt <- "2015-1-1"
+rok <- getSymbols.yahoo ("ROK", from=dt, auto.assign = F)
+rokClose <- na.omit(getSymbols.yahoo ("ROK", from=dt, auto.assign = F)[ ,4])
+rokRets <- na.omit(dailyReturn( rokClose, type="log"))
+
+         
+``` 
+
+Sidebar {.sidebar}
+=====================================
+
+```{r}
+renderText("The source of data for this project is Yahoo finance. To get the ticker of the desired stock, please CLICK on 'Yahoo Finance' and type the name of the company on the yahoo finance webpage to get the ticker.")
+```
+
+
+```{r}
+selectInput("stock_ticker", label = "Stocks:",
+            choices = stock_ticker, selected = "^GSPC")
+
+sliderInput("wts", label = "Weight:",
+            min = 0.05, max = 1, value = 1, step = 0.05)
+```
+
+```{r}
+helpText("For a well diversified portfolio, stock correlation should not be high among all stocks!")
+
+```
+
+Stocks {data-icon="fa-info"}
+======================================================================  
+
+rows {data-height=50}
+-----------------------------------
+```{r}
+renderText({ paste("The stocks,their correlations, and individual performance") })
+
+```
+
+rows {data-height=300}
+-----------------------------------
+### Portfolio Composition {data-width=300}
+```{r}
+webar
+```
+
+
+### Stocks Correlation {data-width=500}
+```{r}
+corrplot(stocks_correlate)
+```
+
+Row {.tabset .tabset-fade}
+-------------------------------------
+### Returns
+```{r}
+Returns
+
+```
+
+### Volumes
+```{r}
+Volumes
+
+```
+
+### Prices
+```{r}
+Prices
+
+```
+
+Row {.tabset .tabset-fade}
+-------------------------------------
+
+### Portfolio, assets and index mean
+
+```{r}
+hc_hist_fun <- function(n = 1, object, color){
+  hc_hist <- hist(object[, stock_ticker[n]],
+                  breaks = 50,
+                  plot = FALSE)
+  hchart(hc_hist, color = color) %>%
+    hc_title(text =
+               paste(stock_ticker[n],
+                     "Log Returns Distribution",
+                     sep = " ")) %>%
+    hc_add_theme(hc_theme_flat()) %>%
+    hc_exporting(enabled = TRUE) %>%
+    hc_legend(enabled = FALSE)
+}
+hc_hist_fun(1, Return_Monthly, "cornflowerblue")
+hc_hist_fun(2, Return_Monthly, "green")
+hc_hist_fun(3, Return_Monthly, "pink")
+hc_hist_fun(4, Return_Monthly, "red")
+map(1:4, hc_hist_fun, Return_Monthly, "blue")
+```
+
+Row {.tabset .tabset-fade}
+-------------------------------------
+
+#### Mean
+````{r}
+Mean_asset_return = 
+  mean(Return_Monthly)
+```
+
+### Variance
+```{r}
+ptf_variance =
+  var(PF_monthly_returns)
+```
+
+
+### standard deviation
+```{r}
+portfolio_sd_xts =
+  StdDev(Return_Monthly, weights = wts)
+portfolio_sd_xts_percent =
+  round(portfolio_sd_xts * 100, 2)
+portfolio_sd_xts_percent[1,1]
+```
+
+Row {.tabset .tabset-fade}
+-------------------------------------
+
+### covariance Matrix
+```{r}
+# covariance,
+PF_var_covar_matrix = cov(Return_Monthly)
+round(PF_var_covar_matrix, 4)
+```
+
+
+### Quantiles
+
+```{r}
+# quantiles
+Return_quantiles = 
+  quantile(Return_Monthly)
+```
+
+### Skewness
+
+```{r}
+# Skewness
+Return_skewness =
+  skewness(Return_Monthly)
+plot(density(Return_Monthly))
+```
+
+
+```{r}
+Index_Skewness =
+  skewness(Return_Monthly_Index)
+```
+
+Row {.tabset .tabset-fade}
+-------------------------------------
+### Kurtosis
+
+```{r}
+# kurtosis
+Return_kurt_xts =
+  kurtosis(Return_Monthly)
+plot(density(Return_Monthly))
+```
+
+
+### density
+
+```{r}
+Index_Kurt = 
+  Return_Monthly_Index
+plot(density(Return_Monthly_Index))
+```
+
+### Boxplot
+
+```{r}
+boxplot(as.matrix(Return_Monthly))
+```
+
+Portfolio Risk {data-navmenu="Historic Risk:Return"}
+======================================================================
+
+###  Portfolio Return vs S&P500 (Monthly Return)
+```{r , echo=FALSE}
+HC_Return_vs_Index
+
+```
+
+Row {.tabset .tabset-fade}
+-------------------------------------    
+
+### Portfolio Return per $
+```{r}
+Portfolio_Monthly_DoReturn
+
+```
+
+### Portfolio Return per % (Monthly)
+
+```{r}
+Portfolio_Monthly_Return
+```
+
+Row {.tabset .tabset-fade}
+-------------------------------------
+   
+### Portfolio : Return / Risks
+
+```{r}
+Risk_Return
+```   
+``` 
+ -Sharpe ratio evaluates the return of an investment compared to the rate of return on a risk-free investment like the German government treasury bonds, therefore considers the total risk.
+ StDev SharpeRatio is the classic sharpe measure which uses the standard deviation of returns.
+  ``` 
+  **Sharpe = Risk premium / SD of returns
+ - VarSharpe and ESSharpe, use the Value at risk and Expected shortfall as risk measures instead of the standard deviation of returns.** 
+  
+   **Sharpe ratio greater than 1.0 is considered good.
+ - A ratio higher than 2.0 is rated as very good, and 3.0 or higher is considered excellent.A ratio under 1.0 is considered sub-optimal.(Investopedia)**
+
+ - Informationation ratio has similar indications of the Sharpe ratio. But uses a benchmark (Standard & Poor's 500 Index (S&P 500) for this work), instead of a risk-free asset.
+ -JensenAlpha and Treynor measures evaluates the return relative to the systemic risks only (beta).
+ - Positive JensenAlpha and Treynor measures are desired for a good portfolio.
+ ``` 
+ **For all the above measures, the higher the ratio,the better the returns compared to risks.
+PLEASE SEE 'About' FOR MORE INFORMATION**
+``` 
+### Stocks : Return / Risks
+  **Standard Deviation and Sharpe Ratio for the individual stocks.** 
+  **The higher ther sharpe ratio, the better.**
+  **The lower the standard deviation, the better.** 
+
+```{r}
+Stocks_SharpeRatio
+```
+
+```{r}
+Stocks_SD
+```
+
+
+Market Risk {data-navmenu="Historic Risk:Return"}
+======================================================================
+
+Row {.tabset .tabset-fade}
+-------------------------------------  
+
+```{r}
+options(knitr.duplicate.label = "allow") 
+maxDate <- "2015-01-01" 
+
+SP500 = getSymbols('^GSPC', from = maxDate, env=NULL)
+
+WMT = getSymbols('WMT',from=maxDate, env=NULL)
+APPL = getSymbols('AAPL',from=maxDate, env=NULL)
+AMZN = getSymbols('AMZN', from=maxDate, env =NULL)
+ROK = getSymbols('ROK', from=maxDate, env =NULL)
+``` 
+
+```{r} 
+WMT.close = getSymbols('WMT', from=maxDate, env =NULL )[,4]
+AAPL.close = getSymbols('AAPL', from=maxDate, env =NULL )[,4]
+AMZN.close = getSymbols('AMZN', from=maxDate, env =NULL )[,4]
+ROK.close = getSymbols('ROK', from=maxDate, env =NULL )[,4] 
+
+SP500.close = getSymbols('^GSPC', from = maxDate, auto.assign=F)
+``` 
+
+```{r} 
+WMTreturns = dailyReturn(WMT.close, type="log") 
+AAPLreturns = dailyReturn(AAPL.close, type="log")
+AMZNreturns = dailyReturn(AMZN.close, type="log")
+ROKreturns = dailyReturn(ROK.close, type="log") 
+
+SP500returns = dailyReturn(SP500.close, type ="log") 
+``` 
+
+```{r} 
+covWMT.SP500 = cov(WMTreturns,SP500returns) 
+covAAPL.SP500 = cov(AAPLreturns,SP500returns)  
+covAMZN.SP500 = cov(AMZNreturns,SP500returns)   
+covROK.SP500 = cov(ROKreturns,SP500returns) 
+ 
+VARSP500 = var(SP500returns)   
+``` 
+
+```{r}
+betaWMT = covWMT.SP500/VARSP500
+betaAAPL = covAAPL.SP500/VARSP500
+betaAMZN = covAMZN.SP500/VARSP500 
+betaROK = covROK.SP500/VARSP500 
+``` 
+
+```{r} 
+tickers <- c("WMT", "AAPL", "AMZN","ROK")  
+all.beta = data.frame(rbind(betaAAPL, betaAMZN, betaWMT, betaROK)) 
+rownames(all.beta) = c("AAPL","AMZN","WMT", "ROK")
+colnames(all.beta) = c("beta")
+``` 
+
+
+```{r pressure, echo=FALSE}  
+maxDate <- "2015-01-01" 
+AAPL.prices <- Ad(getSymbols("AAPL", auto.assign = F, from=maxDate))
+AAPL.rets <- dailyReturn(AAPL.prices)
+VaR(AAPL.rets, p=0.95, method ="historical" )
+VaR(AAPL.rets, p=0.99, method ="historical" ) 
+
+CVaR(AAPL.rets, p= 0.95,method ="historical" ) 
+ES(AAPL.rets, p= 0.99,method ="historical" ) 
+``` 
+ 
+ 
+```{r} 
+tickers <- c("AMZN", "AAPL", "WMT","ROK") 
+weights <- c(0.25, 0.25, 0.25, 0.25)
+getSymbols(tickers, from=maxDate)
+``` 
+
+```{r} 
+Port.prices <- na.omit(merge(Ad(AMZN), Ad(AAPL), Ad(WMT), Ad(ROK)))
+ 
+Port.returns <- ROC(Port.prices, type = "discrete")[-1,] 
+colnames(Port.returns) <- tickers
+``` 
+
+```{r} 
+VaR(Port.returns, p=0.99,portfolio_method =  "component" , method = "modified") 
+CVaR(Port.returns, p=0.99, portfolio_method =  "component" , method = "modified") 
+ES(Port.returns, p=0.99, portfolio_method =  "component" , method = "modified" )
+```   
+
+```{r} 
+VaR.Hist <- VaR(Port.returns, P=0.95,weights = NULL, portfolio_method = "single", method = "historical")
+VaR.Gaus <- VaR(Port.returns, P=0.95,weights = NULL, portfolio_method = "single", method = "gaussian")
+VaR.mod <- VaR(Port.returns, P=0.95,weights = NULL, portfolio_method = "single", method = "modified")
+``` 
+
+```{r}  
+CVaR.Hist <- CVaR(Port.returns, P=0.95,weights = NULL, portfolio_method = "single", method = "historical") 
+CVaR.Gaus <- CVaR(Port.returns, P=0.95,weights = NULL, portfolio_method = "single", method = "gaussian")
+CVaR.mod <- CVaR(Port.returns, P=0.95,weights = NULL, portfolio_method = "single", method = "modified")
+```  
+
+
+```{r} 
+All.VaR <- data.frame(rbind(VaR.Hist, VaR.Gaus, VaR.mod))                       
+rownames(All.VaR) <- c("Hist", "Gaus","Mod")  
+All.CVaR <-data.frame(rbind(CVaR.Hist, CVaR.Gaus, CVaR.mod))                       
+rownames(All.CVaR) <- c("Hist", "Gaus","Mod")
+```  
+
+```{r} 
+PortVaR.Hist <- VaR(Port.returns, P=0.95, portfolio_method = "component", method = "historical")$hVaR  
+PortVaR.Gaus <- VaR(Port.returns, P=0.95, portfolio_method = "component", method = "gaussian")$VaR[1]
+PortVaR.Mod <- VaR(Port.returns, P=0.95, portfolio_method = "component", method = "modified")$MVaR[1]  
+``` 
+
+```{r} 
+PortCVaR.Hist <- CVaR(Port.returns, P=0.95, portfolio_method = "component", method = "historical")$`-r_exceed/c_exceed`[1]  
+PortCVaR.Gaus <- CVaR(Port.returns, P=0.95, portfolio_method = "component", method = "gaussian")$ES[1]
+PortCVaR.Mod <- CVaR(Port.returns, P=0.95, portfolio_method = "component", method = "modified")$MES[1] 
+```
+
+```{r}
+All.VaR$portfolio <- 0 
+All.CVaR$portfolio <- 0
+All.VaR$portfolio <- c(PortVaR.Hist, PortVaR.Gaus,PortVaR.Mod) 
+All.CVaR$portfolio <- c(PortCVaR.Hist,PortCVaR.Gaus,PortCVaR.Mod)
+``` 
+
+```{r}
+All.VaR<- abs(All.VaR) 
+All.CVaR<- abs(All.CVaR) 
+All.VaR$Type <- c("Hist", "gaus", "mod")  
+All.CVaR$Type <- c("Hist", "gaus", "mod")
+```  
+
+Row {.tabset .tabset-fade}
+------------------------------------- 
+
+### VaR 
+```{r} 
+PlotVaR <- melt(All.VaR, variable.name = "ticker", value.name = "VaR" )
+ggplot(PlotVaR, aes(x=Type,y=VaR, fill=ticker))+geom_bar(stat = "identity",position = "dodge")  
+``` 
+
+### CVaR
+```{r}  
+PlotCVaR <- melt(All.CVaR, variable.name = "ticker", value.name = "CVaR")
+ggplot(PlotCVaR, aes(x=Type,y=CVaR, fill=ticker))+geom_col(position = "dodge") 
+```
+
+### Stocks Beta
+```{r}   
+ggplot(all.beta, aes(x= tickers ,y= beta, fill="tickers"))+geom_bar(stat = "identity",position = "dodge")
+``` 
+
+
+About {data-icon="fa-question"}
+========================================
+Row {.tabset .tabset-fade}
+----------------------------------- 
+### About this project
+
+```
+This dashboard is an assignment for Databases & programming for Finance and Accounting course, AFA 2021. 
+
+The objective of the dashboard is to provide general information on the performance of the individual stocks. After which, we join them to create a portfolio that we compare with an index. 
+
+The first page should provide general information on the stocks prices, volumes, and return. Other pages provide information in the performance of the stocks combined as a portfolio vs S&P 500 as index. 
+
+There are three inputs 
+The stocks tickers
+The index ticker
+The desired weights we wish to give to each stock in the portfolio
+
+ For this project, we use a mix of growth stocks, value stocks, and stocks with momentum. Compared to the S&P 500 index.
+```
+### Stocks Distribution
+
+The moving average (MA) is a simple technical analysis tool that smooths out price data by creating a constantly updated average price. The average is taken over a specific period of time, like 10 days, 20 minutes, 30 weeks or any time period the trader chooses.
+
+A Bollinger Band is a technical analysis tool defined by a set of trendlines plotted two standard deviations (positively and negatively) away from a simple moving average (SMA) of a security's price, but which can be adjusted to user preferences.
+
+The Money Flow Index (MFI) is a technical oscillator that uses price and volume data for identifying overbought or oversold signals in an asset. It can also be used to spot divergences which warn of a trend change in price. The oscillator moves between 0 and 100.
+
+
+The mean of a probability distribution is the long-run arithmetic average value of a random variable having that distribution. If the random variable is denoted by , then it is also known as the expected value of (denoted ).
+
+
+The variance (σ2), is defined as the sum of the squared distances of each term in the distribution from the mean (μ), divided by the number of terms in the distribution (N). You take the sum of the squares of the terms in the distribution, and divide by the number of terms in the distribution (N).
+
+
+Quantiles are cut points dividing the range of a probability distribution into continuous intervals with equal probabilities, or dividing the observations in a sample in the same way.
+
+
+Kurtosis is a measure of the combined weight of a distribution's tails relative to the center of the distribution. When a set of approximately normal data is graphed via a histogram, it shows a bell peak and most data within + or - three standard deviations of the mean.
+
+
+Skewness is a measure of the asymmetry of the probability distribution of a real-valued random variable about its mean. The skewness value can be positive, zero, negative, or undefined.
+
+
+### Risk Measures 
+```
+Risk related :  
+
+Risk management is a crucial process used to make investment decisions. The process involves identifying and analyzing the amount of risk involved in an investment, and either accepting that risk or mitigating it. Some common measures of risk include standard deviation, beta, value at risk (VaR), and conditional value at risk (CVaR).
+```
+Beta
+Beta is a measure of a stock's volatility in relation to the overall market. By definition, the market, such as the S&P 500 Index, has a beta of 1.0, and individual stocks are ranked according to how much they deviate from the market. 
+ The meaning of the beta measured:A stock that swings more than the market over time has a beta above 1.0. If a stock moves less than the market, the stock's beta is less than 1.0. High-beta stocks are supposed to be riskier but provide higher return potential; low-beta stocks pose less risk but also lower returns. 
+ 
+Beta is calculated using regression analysis. Numerically, it represents the tendency for a security's returns to respond to swings in the market. The formula for calculating beta is the covariance of the return of an asset with the return of the benchmark divided by the variance of the return of the benchmark over a certain period. 
+
+BETA's Formula : Covarianvce(Rs,Rm)/VAR(Rm) 
+
+VaR
+ Value at risk (VaR) is a statistic that measures and quantifies the level of financial risk within a firm, portfolio or position over a specific time frame. This metric is most commonly used by investment and commercial banks to determine the extent and occurrence ratio of potential losses in their institutional portfolios. 
+ 
+Risk managers use VaR to measure and control the level of risk exposure. One can apply VaR calculations to specific positions or whole portfolios or to measure firm-wide risk exposure
+    
+Formula for VaR  
+VaR=[Expected Weighted Return of the Portfolio
+− (z-score of the confidence interval
+× standard deviation of the portfolio)]
+× portfolio value
+
+CVaR
+Conditional Value at Risk (CVaR), also known as the expected shortfall, is a risk assessment measure that quantifies the amount of tail risk an investment portfolio has. CVaR is derived by taking a weighted average of the “extreme” losses in the tail of the distribution of possible returns, beyond the value at risk (VaR) cutoff point. Conditional value at risk is used in portfolio optimization for effective risk management. 
+Conditional Value at Risk (CVaR) Formula: 
+ 
+CVaR = 1/1-C ∫VaR xp(x)dx           -1
+where  
+p(x)dx=the probability density of getting a return with value “x” 
+c=the cutoff point on the distribution where the analyst   sets the VaR breakpoint 
+VaR=the agreed-upon VaR level
+ 
+### Risk Return Measures 
+```
+For the stock Performance
+Return compared to Risk
+The higher the measure,the better the risk-return tradeoff.
+```
+Sharpe Ratio:   
+Portfolio's return per total risk.(Diversifiable risk is considered)
+The resulting value represents the portfolio's return per systematic risk.
+The risk premium (Average Annual Return-risk-free rate of return) /Portfolio Standard Deviation
+
+InformationRatio (IR):
+Measures portfolio returns above the returns of a benchmark (S&P 500) to the volatility of those returns.
+(Total return of benchmark index - Total portfolio return)/tracking error
+
+The tracking error:  Standard deviation of the difference between portfolio returns and index returns.
+(Investopedia)
+
+Treynor Measure:
+Portfolio's return per systematic risk.(Diversifiable risk is not considered)
+The risk premium (Average Annual Return- /the portfolio risk (Beta) 
+
+Jensen Measure (alpha):
+Expected return of the portfolio(CAPM) - Actual return. (Diversifiable risk is not considered)
+
